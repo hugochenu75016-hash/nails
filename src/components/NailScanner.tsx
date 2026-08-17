@@ -6,7 +6,7 @@ import { getHandLandmarker } from "@/lib/handLandmarker";
 import { CARD_WIDTH_MM, CARD_HEIGHT_MM } from "@/lib/calibration";
 import { FINGERS, measureFingerWidths } from "@/lib/nailMeasurement";
 
-type Step = "loading" | "calibrate" | "scan" | "results";
+type Step = "intro" | "loading" | "calibrate" | "scan" | "results";
 
 /** Fraction of the video frame width the calibration guide rectangle
  * covers. The user aligns their card to this box, which fixes the
@@ -67,9 +67,10 @@ export default function NailScanner() {
   const rafRef = useRef<number | null>(null);
   const latestResultRef = useRef<HandLandmarkerResult | null>(null);
   const pxPerMmRef = useRef<number | null>(null);
-  const stepRef = useRef<Step>("loading");
+  const stepRef = useRef<Step>("intro");
 
-  const [step, setStep] = useState<Step>("loading");
+  const [step, setStep] = useState<Step>("intro");
+  const [started, setStarted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [handDetected, setHandDetected] = useState(false);
   const [results, setResults] = useState<Result[] | null>(null);
@@ -80,6 +81,7 @@ export default function NailScanner() {
 
   // Start camera + hand landmark model, then run a continuous detection loop.
   useEffect(() => {
+    if (!started) return;
     let cancelled = false;
 
     async function start() {
@@ -144,6 +146,11 @@ export default function NailScanner() {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
+  }, [started]);
+
+  const beginScan = useCallback(() => {
+    setStep("loading");
+    setStarted(true);
   }, []);
 
   const confirmCalibration = useCallback(() => {
@@ -186,6 +193,28 @@ export default function NailScanner() {
     <div className="mx-auto max-w-2xl px-6 py-10">
       {error ? (
         <p className="rounded-xl bg-red-50 p-4 text-red-700">{error}</p>
+      ) : step === "intro" ? (
+        <div className="text-center">
+          <h2 className="font-semibold">Avant de commencer</h2>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/hand-guide.png"
+            alt="Exemple de bonne position : paume face à la caméra, doigts écartés, main centrée dans le cadre, fond uni"
+            className="mx-auto mt-4 w-full max-w-sm rounded-2xl border border-neutral-200"
+          />
+          <ul className="mx-auto mt-4 max-w-sm space-y-1 text-left text-sm text-neutral-600">
+            <li>• Paume (ou dos de la main) bien face à la caméra</li>
+            <li>• Doigts écartés, main centrée dans le cadre</li>
+            <li>• Fond uni et bonne lumière, sans ombre dure</li>
+            <li>• Garde la même distance à la calibration et au scan</li>
+          </ul>
+          <button
+            onClick={beginScan}
+            className="mt-6 rounded-full bg-neutral-900 px-6 py-2.5 text-white font-medium hover:bg-neutral-700 transition-colors"
+          >
+            Commencer le scan
+          </button>
+        </div>
       ) : (
         <>
           <div className="relative w-full overflow-hidden rounded-2xl bg-black aspect-[4/3]">
