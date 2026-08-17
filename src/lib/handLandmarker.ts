@@ -15,14 +15,21 @@ export function getHandLandmarker(): Promise<HandLandmarker> {
   if (!landmarkerPromise) {
     landmarkerPromise = (async () => {
       const vision = await FilesetResolver.forVisionTasks(WASM_BASE);
-      return HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: MODEL_URL,
-          delegate: "GPU",
-        },
-        runningMode: "VIDEO",
-        numHands: 1,
-      });
+      try {
+        return await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+          runningMode: "VIDEO",
+          numHands: 1,
+        });
+      } catch {
+        // Some in-app/embedded browsers (Instagram, TikTok, etc.) restrict
+        // WebGL, which the GPU delegate needs. Fall back to CPU.
+        return await HandLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+          runningMode: "VIDEO",
+          numHands: 1,
+        });
+      }
     })();
   }
   return landmarkerPromise;
