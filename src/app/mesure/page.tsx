@@ -2,7 +2,7 @@ import Link from "next/link";
 import NailScanner from "@/components/NailScanner";
 
 export const metadata = {
-  title: "Mesurer mes ongles — NailFit",
+  title: "Mesurer mes ongles — ONE STUD'",
 };
 
 export default function MesurePage() {
