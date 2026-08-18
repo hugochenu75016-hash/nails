@@ -8,6 +8,7 @@ import { CARD_WIDTH_MM, CARD_HEIGHT_MM } from "@/lib/calibration";
 import { FINGERS, measureFingerWidths } from "@/lib/nailMeasurement";
 import { assessPose, POSE_MESSAGES, type PoseIssue } from "@/lib/poseQuality";
 import { saveMeasurements } from "@/lib/measurementsStore";
+import GhostHand from "@/components/GhostHand";
 
 type Step = "intro" | "loading" | "calibrate" | "scan" | "closing";
 
@@ -272,6 +273,23 @@ export default function NailScanner() {
               className="absolute inset-0 h-full w-full"
             />
 
+            {step === "scan" && (
+              <>
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
+                  <GhostHand good={poseIssue === "good"} className="h-full max-h-full drop-shadow-lg" />
+                </div>
+                <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent px-4 pb-4 pt-12">
+                  <p
+                    className={`text-center text-base font-semibold transition-colors ${
+                      poseIssue === "good" ? "text-green-400" : "text-white"
+                    }`}
+                  >
+                    {POSE_MESSAGES[poseIssue]}
+                  </p>
+                </div>
+              </>
+            )}
+
             {step === "closing" && (
               <div className="absolute inset-0 overflow-hidden">
                 <div
@@ -322,20 +340,10 @@ export default function NailScanner() {
             )}
 
             {step === "scan" && (
-              <div className="text-center">
-                <h2 className="font-semibold">Scan de la main</h2>
-                <p
-                  className={`mt-1 text-sm font-medium ${
-                    poseIssue === "good" ? "text-green-600" : "text-neutral-600"
-                  }`}
-                >
-                  {POSE_MESSAGES[poseIssue]}
-                </p>
-                <p className="mt-1 text-xs text-neutral-400">
-                  Le scan se lance automatiquement dès que la position est
-                  bonne, pas besoin d&apos;appuyer sur un bouton.
-                </p>
-              </div>
+              <p className="text-center text-xs text-neutral-400">
+                Le scan se lance automatiquement dès que la position est
+                bonne, pas besoin d&apos;appuyer sur un bouton.
+              </p>
             )}
 
             {step === "closing" && (
