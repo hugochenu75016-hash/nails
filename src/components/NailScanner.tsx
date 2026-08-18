@@ -2,120 +2,53 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { HandLandmarkerResult } from "@mediapipe/tasks-vision";
-import { getHandLandmarker } from "@/lib/handLandmarker";
 import { CARD_WIDTH_MM, CARD_HEIGHT_MM } from "@/lib/calibration";
-import { FINGERS, measureFingerWidths } from "@/lib/nailMeasurement";
-import { assessPose, POSE_MESSAGES, type PoseIssue } from "@/lib/poseQuality";
-import { saveMeasurements } from "@/lib/measurementsStore";
-import GhostHand from "@/components/GhostHand";
+import {
+  FINGER_ORDER,
+  BOX_WIDTH_FRAC,
+  BOX_HEIGHT_FRAC,
+  MIN_WIDTH_MM,
+  MAX_WIDTH_MM,
+  scanFingerBox,
+} from "@/lib/fingerBox";
+import { saveMeasurements, type FingerMeasurementMm } from "@/lib/measurementsStore";
 
-type Step = "intro" | "loading" | "calibrate" | "scan" | "closing";
-
-/** How long the pose must stay "good" (in ms) before we auto-capture. */
-const STABLE_MS = 900;
+type Step = "intro" | "loading" | "calibrate" | "fingerScan" | "closing";
 
 /** Fraction of the video frame width the calibration guide rectangle
  * covers. The user aligns their card to this box, which fixes the
  * px-per-mm ratio for whatever is at that distance from the camera. */
 const CARD_FRACTION_W = 0.55;
 
-function draw(
-  canvas: HTMLCanvasElement,
-  result: HandLandmarkerResult,
-  currentStep: Step
-) {
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  if (currentStep === "calibrate") {
-    const rectW = canvas.width * CARD_FRACTION_W;
-    const rectH = rectW * (CARD_HEIGHT_MM / CARD_WIDTH_MM);
-    const x = (canvas.width - rectW) / 2;
-    const y = (canvas.height - rectH) / 2;
-    ctx.strokeStyle = "#22c55e";
-    ctx.lineWidth = Math.max(2, canvas.width * 0.004);
-    ctx.setLineDash([12, 8]);
-    ctx.strokeRect(x, y, rectW, rectH);
-    ctx.setLineDash([]);
-    return;
-  }
-
-  const landmarks = result.landmarks[0];
-  if (!landmarks) return;
-
-  ctx.fillStyle = "#22c55e";
-  for (const { dip, tip } of FINGERS) {
-    const d = landmarks[dip];
-    const t = landmarks[tip];
-    ctx.beginPath();
-    ctx.moveTo(d.x * canvas.width, d.y * canvas.height);
-    ctx.lineTo(t.x * canvas.width, t.y * canvas.height);
-    ctx.strokeStyle = "#22c55e";
-    ctx.lineWidth = Math.max(2, canvas.width * 0.003);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(t.x * canvas.width, t.y * canvas.height, 5, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
+/** How long a finger must sit "good" in the box (in ms) before we
+ * auto-capture it and move to the next one. */
+const STABLE_MS = 700;
+const SCAN_INTERVAL_MS = 180;
 
 export default function NailScanner() {
   const router = useRouter();
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const latestResultRef = useRef<HandLandmarkerResult | null>(null);
+  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const pxPerMmRef = useRef<number | null>(null);
-  const stepRef = useRef<Step>("intro");
+  const measurementsRef = useRef<FingerMeasurementMm[]>([]);
   const goodSinceRef = useRef<number | null>(null);
   const capturingRef = useRef(false);
-  const lastIssueRef = useRef<PoseIssue | null>(null);
 
   const [step, setStep] = useState<Step>("intro");
   const [started, setStarted] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [poseIssue, setPoseIssue] = useState<PoseIssue>("no-hand");
+  const [fingerIndex, setFingerIndex] = useState(0);
+  const [fingerGood, setFingerGood] = useState(false);
   const [closed, setClosed] = useState(false);
 
-  useEffect(() => {
-    stepRef.current = step;
-  }, [step]);
-
-  const captureAndClose = useCallback(() => {
-    const video = videoRef.current;
-    const pxPerMm = pxPerMmRef.current;
-    const result = latestResultRef.current;
-    const landmarks = result?.landmarks[0];
-    if (!video || !pxPerMm || !landmarks) return;
-
-    const off = document.createElement("canvas");
-    off.width = video.videoWidth;
-    off.height = video.videoHeight;
-    const ctx = off.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, off.width, off.height);
-    const imageData = ctx.getImageData(0, 0, off.width, off.height);
-
-    const maxScanPx = pxPerMm * 12; // widest plausible half-finger-width, in mm
-    const raw = measureFingerWidths(imageData, landmarks, maxScanPx);
-
-    saveMeasurements(
-      raw.map((r) => ({
-        name: r.name,
-        widthMm: Math.round((r.widthPx / pxPerMm) * 10) / 10,
-        confident: r.confident,
-      }))
-    );
-
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+  const finishAndClose = useCallback(() => {
+    saveMeasurements(measurementsRef.current);
     streamRef.current?.getTracks().forEach((t) => t.stop());
     setStep("closing");
   }, []);
 
-  // Start camera + hand landmark model, then run a continuous detection loop.
+  // Start the camera once the client has read the instructions.
   useEffect(() => {
     if (!started) return;
     let cancelled = false;
@@ -123,7 +56,10 @@ export default function NailScanner() {
     async function start() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" } },
+          video: {
+            facingMode: { ideal: "environment" },
+            aspectRatio: { ideal: 4 / 3 },
+          },
           audio: false,
         });
         if (cancelled) {
@@ -135,58 +71,11 @@ export default function NailScanner() {
         if (!video) return;
         video.srcObject = stream;
         await video.play();
+        if (!cancelled) setStep("calibrate");
       } catch {
         if (!cancelled) {
           setError(
             "Impossible d'accéder à la caméra. Vérifie les autorisations de ton navigateur."
-          );
-        }
-        return;
-      }
-
-      try {
-        const landmarker = await getHandLandmarker();
-        if (cancelled) return;
-
-        if (!cancelled) setStep("calibrate");
-
-        const loop = () => {
-          const video = videoRef.current;
-          const canvas = canvasRef.current;
-          if (video && canvas && video.readyState >= 2) {
-            if (canvas.width !== video.videoWidth) {
-              canvas.width = video.videoWidth;
-              canvas.height = video.videoHeight;
-            }
-            const now = performance.now();
-            const result = landmarker.detectForVideo(video, now);
-            latestResultRef.current = result;
-            draw(canvas, result, stepRef.current);
-
-            if (stepRef.current === "scan" && !capturingRef.current) {
-              const issue = assessPose(result.landmarks[0]);
-              if (issue !== lastIssueRef.current) {
-                lastIssueRef.current = issue;
-                setPoseIssue(issue);
-              }
-              if (issue === "good") {
-                if (goodSinceRef.current === null) goodSinceRef.current = now;
-                if (now - goodSinceRef.current >= STABLE_MS) {
-                  capturingRef.current = true;
-                  captureAndClose();
-                }
-              } else {
-                goodSinceRef.current = null;
-              }
-            }
-          }
-          rafRef.current = requestAnimationFrame(loop);
-        };
-        rafRef.current = requestAnimationFrame(loop);
-      } catch {
-        if (!cancelled) {
-          setError(
-            "Impossible de charger le modèle de détection de main. Vérifie ta connexion internet."
           );
         }
       }
@@ -196,10 +85,78 @@ export default function NailScanner() {
 
     return () => {
       cancelled = true;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
       streamRef.current?.getTracks().forEach((t) => t.stop());
     };
-  }, [started, captureAndClose]);
+  }, [started]);
+
+  // While scanning a given finger, repeatedly crop the guide box out of the
+  // live video and look for a stable, plausible edge-to-edge width in it.
+  useEffect(() => {
+    if (step !== "fingerScan") return;
+
+    goodSinceRef.current = null;
+    capturingRef.current = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- resetting UI feedback for the newly-targeted finger, not derived data
+    setFingerGood(false);
+
+    const tick = () => {
+      const video = videoRef.current;
+      const pxPerMm = pxPerMmRef.current;
+      if (!video || !pxPerMm || video.readyState < 2 || capturingRef.current) {
+        return;
+      }
+
+      const boxW = Math.round(video.videoWidth * BOX_WIDTH_FRAC);
+      const boxH = Math.round(video.videoHeight * BOX_HEIGHT_FRAC);
+      const boxX = Math.round((video.videoWidth - boxW) / 2);
+      const boxY = Math.round((video.videoHeight - boxH) / 2);
+
+      if (!cropCanvasRef.current) cropCanvasRef.current = document.createElement("canvas");
+      const crop = cropCanvasRef.current;
+      crop.width = boxW;
+      crop.height = boxH;
+      const ctx = crop.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(video, boxX, boxY, boxW, boxH, 0, 0, boxW, boxH);
+      const imageData = ctx.getImageData(0, 0, boxW, boxH);
+
+      const result = scanFingerBox(imageData);
+      const widthMm = result.widthPx / pxPerMm;
+      const good = result.confident && widthMm >= MIN_WIDTH_MM && widthMm <= MAX_WIDTH_MM;
+
+      setFingerGood((prev) => (prev === good ? prev : good));
+
+      if (!good) {
+        goodSinceRef.current = null;
+        return;
+      }
+
+      if (goodSinceRef.current === null) {
+        goodSinceRef.current = performance.now();
+        return;
+      }
+
+      if (performance.now() - goodSinceRef.current >= STABLE_MS) {
+        capturingRef.current = true;
+        measurementsRef.current = [
+          ...measurementsRef.current,
+          {
+            name: FINGER_ORDER[fingerIndex],
+            widthMm: Math.round(widthMm * 10) / 10,
+            confident: true,
+          },
+        ];
+        if (fingerIndex >= FINGER_ORDER.length - 1) {
+          finishAndClose();
+        } else {
+          setFingerIndex((i) => i + 1);
+        }
+      }
+    };
+
+    const interval = setInterval(tick, SCAN_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [step, fingerIndex, finishAndClose]);
 
   const beginScan = useCallback(() => {
     setStep("loading");
@@ -211,7 +168,9 @@ export default function NailScanner() {
     if (!video || !video.videoWidth) return;
     const rectW = video.videoWidth * CARD_FRACTION_W;
     pxPerMmRef.current = rectW / CARD_WIDTH_MM;
-    setStep("scan");
+    measurementsRef.current = [];
+    setFingerIndex(0);
+    setStep("fingerScan");
   }, []);
 
   // Once the "doors" have shut on the confirmed scan, hold on the ONE STUD'
@@ -219,8 +178,6 @@ export default function NailScanner() {
   // measured is ever surfaced to the client on this screen.
   useEffect(() => {
     if (step !== "closing") return;
-    // "closing" is only ever entered once per scan, so `closed` starts at
-    // its initial `false` — no need to reset it here.
     const raf1 = requestAnimationFrame(() => {
       requestAnimationFrame(() => setClosed(true));
     });
@@ -247,10 +204,10 @@ export default function NailScanner() {
             className="mx-auto mt-4 w-full max-w-sm rounded-2xl border border-neutral-200"
           />
           <ul className="mx-auto mt-4 max-w-sm space-y-1 text-left text-sm text-neutral-600">
-            <li>• Paume (ou dos de la main) bien face à la caméra</li>
-            <li>• Doigts écartés, main centrée dans le cadre</li>
+            <li>• On scanne chaque doigt un par un (pouce, index, majeur, annulaire, auriculaire)</li>
+            <li>• Approche un seul doigt à la fois, bien centré dans le cadre</li>
             <li>• Fond uni et bonne lumière, sans ombre dure</li>
-            <li>• Garde la même distance à la calibration et au scan</li>
+            <li>• Garde la même distance à la calibration et à chaque doigt</li>
           </ul>
           <button
             onClick={beginScan}
@@ -268,23 +225,44 @@ export default function NailScanner() {
               playsInline
               muted
             />
-            <canvas
-              ref={canvasRef}
-              className="absolute inset-0 h-full w-full"
-            />
 
-            {step === "scan" && (
+            {step === "calibrate" && (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
+                <div
+                  className="rounded-lg border-4 border-dashed border-green-500"
+                  style={{
+                    width: `${CARD_FRACTION_W * 100}%`,
+                    aspectRatio: `${CARD_WIDTH_MM} / ${CARD_HEIGHT_MM}`,
+                  }}
+                />
+              </div>
+            )}
+
+            {step === "fingerScan" && (
               <>
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
-                  <GhostHand good={poseIssue === "good"} className="h-full max-h-full drop-shadow-lg" />
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                  <div
+                    className={`rounded-2xl border-4 border-dashed transition-colors duration-200 ${
+                      fingerGood ? "border-green-500" : "border-white/80"
+                    }`}
+                    style={{
+                      width: `${BOX_WIDTH_FRAC * 100}%`,
+                      height: `${BOX_HEIGHT_FRAC * 100}%`,
+                    }}
+                  />
                 </div>
                 <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent px-4 pb-4 pt-12">
                   <p
                     className={`text-center text-base font-semibold transition-colors ${
-                      poseIssue === "good" ? "text-green-400" : "text-white"
+                      fingerGood ? "text-green-400" : "text-white"
                     }`}
                   >
-                    {POSE_MESSAGES[poseIssue]}
+                    {fingerGood
+                      ? "Parfait, ne bouge pas…"
+                      : `Place ton ${FINGER_ORDER[fingerIndex]} dans le cadre`}
+                  </p>
+                  <p className="mt-1 text-center text-xs text-white/70">
+                    Doigt {fingerIndex + 1} / {FINGER_ORDER.length}
                   </p>
                 </div>
               </>
@@ -318,7 +296,7 @@ export default function NailScanner() {
           <div className="mt-6">
             {step === "loading" && (
               <p className="text-center text-neutral-500">
-                Chargement de la caméra et du modèle de détection…
+                Chargement de la caméra…
               </p>
             )}
 
@@ -328,7 +306,7 @@ export default function NailScanner() {
                 <p className="mt-1 text-sm text-neutral-600">
                   Place une carte bancaire ou d&apos;identité dans le
                   rectangle vert, à la même distance de la caméra que tu
-                  tiendras ta main ensuite.
+                  tiendras ton doigt ensuite.
                 </p>
                 <button
                   onClick={confirmCalibration}
@@ -339,10 +317,10 @@ export default function NailScanner() {
               </div>
             )}
 
-            {step === "scan" && (
+            {step === "fingerScan" && (
               <p className="text-center text-xs text-neutral-400">
-                Le scan se lance automatiquement dès que la position est
-                bonne, pas besoin d&apos;appuyer sur un bouton.
+                Le scan se lance automatiquement dès que le doigt est bien
+                placé, pas besoin d&apos;appuyer sur un bouton.
               </p>
             )}
 
